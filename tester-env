@@ -1,0 +1,886 @@
+#!/usr/bin/env bash
+# tester-env CLI for Navidrome v0.64.2
+# (101145742f4762164202cb4858c9126258bdc463, latest stable release).
+#
+# Runs the editable checkout in one Docker container, built from the upstream
+# Dockerfile (UI stage: node:lts-alpine npm ci + vite build; Go stage:
+# golang:1.27-alpine CGO build; final: alpine:3.22 with ffmpeg/mpv/sqlite/
+# libwebp). No prebuilt image and no external service: SQLite and the cache
+# live in /data, the library is the /music mount.
+#
+# Ports/state:
+#   host port ${PORT:-53812} -> container 4533 (ND_PORT in the image)
+#   navidrome-data<run-id>  -> /data  (navidrome.db + WAL, cache, JWT secret)
+#   navidrome-music<run-id> -> /music (generated fixture albums)
+#
+# Deterministic credentials: admin / admin, created on the first start from
+# ND_DEVAUTOCREATEADMINPASSWORD, so the create-admin wizard never appears.
+# External services are off (insights/agents/login background), auth rate
+# limiting is off (agents log in repeatedly), plugins are off, and
+# "recently added" sorts by file mtime so fixed fixture mtimes give a stable
+# order.
+#
+# The library is ours: seed generates tagged FLAC albums with the image's
+# ffmpeg (fixed metadata + fixed mtimes) plus folder covers, triggers a full
+# scan, then writes users, playlists, stars/ratings, radio stations and shares
+# through /api and /rest as ordinary app data. Reset = container + both volumes.
+#
+# All commands accept --run-id <id> and --port <port> because scripts/rl-env
+# invokes them that way. RUN_ID scopes containers/volumes only; IMAGE_TAG scopes
+# the image (content-addressed by rl-env, never run-id based).
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-53812}"
+IMAGE_NAME="${IMAGE_TAG:-tester-env-navidrome:dev}"
+DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+
+CONTAINER_PORT=4533
+
+ADMIN_USER="admin"
+ADMIN_PASS="admin"
+
+# Deterministic library ("Sundial Records" listening archive): 10 albums,
+# 47 FLAC tracks, 6 album artists, 5 genres, 2017-2025, one double-disc album.
+# Files carry fixed mtimes (2025-01-06 .. 2025-10-06) that drive "recently
+# added"; no assertion depends on the wall clock.
+EXPECTED_ALBUMS=10
+EXPECTED_TRACKS=47
+EXPECTED_ARTISTS=6
+EXPECTED_PLAYLISTS=4
+EXPECTED_USERS=3
+EXPECTED_RADIOS=2
+EXPECTED_SHARES=2
+
+IS_ADMIN=false
+TOKEN=""
+ALBUMS_JSON=""
+SONGS_JSON=""
+
+SUFFIX=""
+[ "${RUN_ID}" != "default" ] && SUFFIX="-${RUN_ID}"
+CONTAINER_NAME="tester-env-navidrome${SUFFIX}"
+DATA_VOLUME="navidrome-data${SUFFIX}"
+MUSIC_VOLUME="navidrome-music${SUFFIX}"
+
+LOCAL_URL="http://127.0.0.1:${PORT}"
+LABELS=()
+
+refresh_names() {
+  SUFFIX=""
+  [ "${RUN_ID}" != "default" ] && SUFFIX="-${RUN_ID}"
+  CONTAINER_NAME="tester-env-navidrome${SUFFIX}"
+  DATA_VOLUME="navidrome-data${SUFFIX}"
+  MUSIC_VOLUME="navidrome-music${SUFFIX}"
+  LOCAL_URL="http://127.0.0.1:${PORT}"
+  LABELS=(
+    --label "tester-env.project=${TESTER_ENV_PROJECT:-tester-env}"
+    --label "tester-env.app=navidrome"
+    --label "tester-env.scenario=${TESTER_ENV_SCENARIO:-manual}"
+    --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}"
+  )
+}
+refresh_names
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf '==> ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required (JSON assertions)"
+}
+
+container_exists() {
+  docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"
+}
+
+container_running() {
+  docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"
+}
+
+require_running() {
+  container_running || die "container ${CONTAINER_NAME} is not running; run './tester-env deploy' first"
+}
+
+body() { curl -sS --max-time 10 "$@" 2>/dev/null || true; }
+
+# Case-based substring test: avoids the pipefail/SIGPIPE trap of `printf | grep -q`.
+contains() {
+  case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+app_ready() {
+  [ "$(body -o /dev/null -w '%{http_code}' "${LOCAL_URL}/ping")" = "200" ]
+}
+
+wait_for_app() {
+  local deadline=$((SECONDS + 120))
+  log "waiting for navidrome on ${LOCAL_URL}"
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    if app_ready; then
+      log "server is ready on ${LOCAL_URL}/app/"
+      return 0
+    fi
+    if ! container_running; then
+      docker logs --tail 60 "${CONTAINER_NAME}" 2>&1 || true
+      die "container ${CONTAINER_NAME} exited before it answered"
+    fi
+    sleep 1
+  done
+  docker logs --tail 80 "${CONTAINER_NAME}" 2>&1 || true
+  die "server did not answer within 120s"
+}
+
+# Logs in through POST /auth/login; sets TOKEN to the JWT and IS_ADMIN. Every
+# native API call uses it as "X-ND-Authorization: Bearer <token>".
+login_as() {
+  local user="$1" pass="$2" resp
+  resp=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' \
+    -d "{\"username\":\"${user}\",\"password\":\"${pass}\"}" \
+    "${LOCAL_URL}/auth/login") || die "login request failed"
+  TOKEN=$(printf '%s' "${resp}" \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  [ -n "${TOKEN}" ] || die "login as ${user} failed: ${resp}"
+  IS_ADMIN=false
+  contains "${resp}" '"isAdmin":true' && IS_ADMIN=true
+  return 0
+}
+
+login_token() {
+  login_as "${ADMIN_USER}" "${ADMIN_PASS}"
+  [ "${IS_ADMIN}" = true ] || die "login as ${ADMIN_USER} did not return an admin session"
+}
+
+api() { curl -sS --max-time 20 -H "X-ND-Authorization: Bearer ${TOKEN}" "${LOCAL_URL}/api$1"; }
+
+# GET with query parameters (e.g. the UI's own list filters/sorts).
+api_get() {
+  local path="$1"
+  shift
+  curl -sS --max-time 20 -H "X-ND-Authorization: Bearer ${TOKEN}" --get \
+    "${LOCAL_URL}/api${path}" "$@"
+}
+
+api_post() { # <path> <json body>
+  curl -sS --max-time 20 -X POST -H "X-ND-Authorization: Bearer ${TOKEN}" \
+    -H 'Content-Type: application/json' -d "$2" "${LOCAL_URL}/api$1"
+}
+
+api_delete() { # <path> -> HTTP status
+  curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-ND-Authorization: Bearer ${TOKEN}" "${LOCAL_URL}/api$1"
+}
+
+# Subsonic call as the admin (plain password auth keeps it free of salt/token).
+subsonic() { # <view> <query string>
+  curl -sS --max-time 15 \
+    "${LOCAL_URL}/rest/$1.view?u=${ADMIN_USER}&p=${ADMIN_PASS}&v=1.16.1&c=tester-env&f=json&$2"
+}
+
+# --- tiny JSON helpers (python3 only, no jq) --------------------------------
+
+# First object in a JSON array whose <key> equals <value>, field <field>.
+json_pick() { # <key> <value> <field>
+  python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+key, value, field = sys.argv[1:4]
+for row in rows:
+    if str(row.get(key, "")) == value:
+        print(row.get(field, ""))
+        break
+' "$@"
+}
+
+# "id" of a create response object (empty when the body is not JSON).
+json_id() {
+  printf '%s' "${1:-}" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("id", ""))
+except Exception:
+    pass
+'
+}
+
+# Comma-joined <field> values, API order.
+json_list() { # <field>
+  python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+print(",".join(str(r.get(sys.argv[1], "")) for r in rows))
+' "$1"
+}
+
+# Comma-joined <field> values, sorted.
+json_sorted_list() { # <field>
+  python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+print(",".join(sorted(str(r.get(sys.argv[1], "")) for r in rows)))
+' "$1"
+}
+
+# Row count of the JSON array returned by /api/<resource>.
+api_count() {
+  api "$1" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'
+}
+
+cmd_deploy() {
+  need_docker
+  log "building image ${IMAGE_NAME} from ${DOCKERFILE}"
+  # No run-scoped labels on the image: IMAGE_TAG is content-addressed and must
+  # yield the same image ID for identical source across parallel runs.
+  DOCKER_BUILDKIT=1 docker build -t "${IMAGE_NAME}" -f "${DOCKERFILE}" "${SCRIPT_DIR}"
+
+  if container_exists; then
+    log "replacing existing container ${CONTAINER_NAME}"
+    docker stop --time 10 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null
+  fi
+
+  log "starting ${CONTAINER_NAME} on port ${PORT}"
+  docker run -d --name "${CONTAINER_NAME}" "${LABELS[@]}" \
+    -e TZ=UTC \
+    -e ND_ENABLEEXTERNALSERVICES=false \
+    -e ND_AUTHREQUESTLIMIT=0 \
+    -e ND_PLUGINS_ENABLED=false \
+    -e ND_DEVAUTOCREATEADMINPASSWORD="${ADMIN_PASS}" \
+    -e ND_RECENTLYADDEDBYMODTIME=true \
+    -p "${PORT}:${CONTAINER_PORT}" \
+    -v "${DATA_VOLUME}:/data" \
+    -v "${MUSIC_VOLUME}:/music" \
+    "${IMAGE_NAME}" >/dev/null
+
+  wait_for_app
+  login_token
+  log "deployment complete: ${LOCAL_URL}/app/"
+
+  log "login: ${ADMIN_USER}/${ADMIN_PASS}"
+  log "next: ./tester-env seed, then ./tester-env verify"
+}
+
+# Writes the deterministic fixture library into the music volume with the
+# image's ffmpeg. Re-seeding wipes only this volume. Tables are pipe-separated
+# so album names may contain commas.
+write_music_fixtures() {
+  log "generating 10 tagged albums (47 FLAC tracks + folder.jpg) in ${MUSIC_VOLUME}"
+  docker run --rm -i -e TZ=UTC --entrypoint sh -v "${MUSIC_VOLUME}:/music" "${IMAGE_NAME}" -s <<'SH'
+set -eu
+find /music -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+# <album dir>|<cover colour>|<added mtime>
+while IFS='|' read -r dir colour mtime; do
+  mkdir -p "/music/$dir"
+  ffmpeg -hide_banner -loglevel error -y -f lavfi \
+    -i "color=c=$colour:s=600x600:d=1" -frames:v 1 "/music/$dir/folder.jpg" </dev/null
+  touch -t "$mtime" "/music/$dir/folder.jpg"
+done <<'ALBUMS'
+Marina Vale - Blue Harbor|0x2f4858|202501060930
+Oslo Field - Northern Lines|0x33658a|202502030930
+Delta Groove - Low Ceilings|0xa4505a|202503030930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|0x7a6a4f|202504070930
+Delta Groove - Night Bus|0x86bbd8|202505050930
+Clara Voss - Paper Lanterns|0xf6ae2d|202506020930
+Static Meridian - Signal Bloom|0x2f6f6a|202507070930
+Marina Vale - Tidal Works|0x1f4e79|202508040930
+Static Meridian - Static Meridian|0x4b4b4b|202509010930
+Oslo Field - The Quiet Cartographer|0x6a5acd|202510060930
+ALBUMS
+
+# <dir>|<disc>|<discs>|<track>|<tracks>|<title>|<seconds>|<album>|<artist>|<genre>|<year>|<mtime>
+i=0
+while IFS='|' read -r dir disc dtotal track ttotal title secs album artist genre year mtime; do
+  i=$((i + 1))
+  freq=$((170 + i * 13))
+  file="/music/$dir/$(printf '%02d-%02d' "$disc" "$track") $title.flac"
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "sine=frequency=$freq:duration=$secs:sample_rate=44100" -ac 2 \
+    -metadata title="$title" -metadata track="$track/$ttotal" \
+    -metadata disc="$disc/$dtotal" -metadata album="$album" \
+    -metadata artist="$artist" -metadata album_artist="$artist" \
+    -metadata genre="$genre" -metadata date="$year" "$file" </dev/null
+  touch -t "$mtime" "$file" "/music/$dir"
+done <<'TRACKS'
+Marina Vale - Blue Harbor|1|1|1|5|Low Tide|192|Blue Harbor|Marina Vale|Jazz|2021|202501060930
+Marina Vale - Blue Harbor|1|1|2|5|Harbor Lights|245|Blue Harbor|Marina Vale|Jazz|2021|202501060930
+Marina Vale - Blue Harbor|1|1|3|5|Salt & Smoke|167|Blue Harbor|Marina Vale|Jazz|2021|202501060930
+Marina Vale - Blue Harbor|1|1|4|5|Ferryman's Song|320|Blue Harbor|Marina Vale|Jazz|2021|202501060930
+Marina Vale - Blue Harbor|1|1|5|5|Blue Harbor|278|Blue Harbor|Marina Vale|Jazz|2021|202501060930
+Oslo Field - Northern Lines|1|1|1|4|First Snow|372|Northern Lines|Oslo Field|Ambient|2022|202502030930
+Oslo Field - Northern Lines|1|1|2|4|Pale Horizon|304|Northern Lines|Oslo Field|Ambient|2022|202502030930
+Oslo Field - Northern Lines|1|1|3|4|Treeline|238|Northern Lines|Oslo Field|Ambient|2022|202502030930
+Oslo Field - Northern Lines|1|1|4|4|White Noise Waltz|445|Northern Lines|Oslo Field|Ambient|2022|202502030930
+Delta Groove - Low Ceilings|1|1|1|4|Low Ceilings|247|Low Ceilings|Delta Groove|Funk|2019|202503030930
+Delta Groove - Low Ceilings|1|1|2|4|Brass & Velvet|213|Low Ceilings|Delta Groove|Funk|2019|202503030930
+Delta Groove - Low Ceilings|1|1|3|4|Back Room|289|Low Ceilings|Delta Groove|Funk|2019|202503030930
+Delta Groove - Low Ceilings|1|1|4|4|Paid in Full|226|Low Ceilings|Delta Groove|Funk|2019|202503030930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|1|2|1|3|Gathering Song|233|Field Notes, Vol. 1|Clara Voss & The Lantern Choir|Folk|2020|202504070930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|1|2|2|3|Long Table|258|Field Notes, Vol. 1|Clara Voss & The Lantern Choir|Folk|2020|202504070930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|1|2|3|3|Harvest Bell|204|Field Notes, Vol. 1|Clara Voss & The Lantern Choir|Folk|2020|202504070930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|2|2|1|3|Evening Service|276|Field Notes, Vol. 1|Clara Voss & The Lantern Choir|Folk|2020|202504070930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|2|2|2|3|Ash Wednesday|219|Field Notes, Vol. 1|Clara Voss & The Lantern Choir|Folk|2020|202504070930
+Clara Voss & The Lantern Choir - Field Notes, Vol. 1|2|2|3|3|Field Notes|312|Field Notes, Vol. 1|Clara Voss & The Lantern Choir|Folk|2020|202504070930
+Delta Groove - Night Bus|1|1|1|5|Last Stop|214|Night Bus|Delta Groove|Funk|2023|202505050930
+Delta Groove - Night Bus|1|1|2|5|Downtown|268|Night Bus|Delta Groove|Funk|2023|202505050930
+Delta Groove - Night Bus|1|1|3|5|Uptown Lights|191|Night Bus|Delta Groove|Funk|2023|202505050930
+Delta Groove - Night Bus|1|1|4|5|Night Bus|302|Night Bus|Delta Groove|Funk|2023|202505050930
+Delta Groove - Night Bus|1|1|5|5|Corner Store|233|Night Bus|Delta Groove|Funk|2023|202505050930
+Clara Voss - Paper Lanterns|1|1|1|5|Riverbank|206|Paper Lanterns|Clara Voss|Folk|2022|202506020930
+Clara Voss - Paper Lanterns|1|1|2|5|Held Open|231|Paper Lanterns|Clara Voss|Folk|2022|202506020930
+Clara Voss - Paper Lanterns|1|1|3|5|Lantern Song|184|Paper Lanterns|Clara Voss|Folk|2022|202506020930
+Clara Voss - Paper Lanterns|1|1|4|5|Winter Market|262|Paper Lanterns|Clara Voss|Folk|2022|202506020930
+Clara Voss - Paper Lanterns|1|1|5|5|Homewards|297|Paper Lanterns|Clara Voss|Folk|2022|202506020930
+Static Meridian - Signal Bloom|1|1|1|5|Bloom|261|Signal Bloom|Static Meridian|Electronic|2023|202507070930
+Static Meridian - Signal Bloom|1|1|2|5|Static Drift|334|Signal Bloom|Static Meridian|Electronic|2023|202507070930
+Static Meridian - Signal Bloom|1|1|3|5|Relay|218|Signal Bloom|Static Meridian|Electronic|2023|202507070930
+Static Meridian - Signal Bloom|1|1|4|5|Shortwave|287|Signal Bloom|Static Meridian|Electronic|2023|202507070930
+Static Meridian - Signal Bloom|1|1|5|5|Signal Bloom|405|Signal Bloom|Static Meridian|Electronic|2023|202507070930
+Marina Vale - Tidal Works|1|1|1|6|Breakwater|228|Tidal Works|Marina Vale|Jazz|2024|202508040930
+Marina Vale - Tidal Works|1|1|2|6|Tidal Works|341|Tidal Works|Marina Vale|Jazz|2024|202508040930
+Marina Vale - Tidal Works|1|1|3|6|Gull Point|199|Tidal Works|Marina Vale|Jazz|2024|202508040930
+Marina Vale - Tidal Works|1|1|4|6|Slack Water|275|Tidal Works|Marina Vale|Jazz|2024|202508040930
+Marina Vale - Tidal Works|1|1|5|6|Undertow|254|Tidal Works|Marina Vale|Jazz|2024|202508040930
+Marina Vale - Tidal Works|1|1|6|6|Harbourmaster|386|Tidal Works|Marina Vale|Jazz|2024|202508040930
+Static Meridian - Static Meridian|1|1|1|4|Carrier|243|Static Meridian|Static Meridian|Electronic|2017|202509010930
+Static Meridian - Static Meridian|1|1|2|4|Ionosphere|368|Static Meridian|Static Meridian|Electronic|2017|202509010930
+Static Meridian - Static Meridian|1|1|3|4|Night Shift|296|Static Meridian|Static Meridian|Electronic|2017|202509010930
+Static Meridian - Static Meridian|1|1|4|4|Dead Air|331|Static Meridian|Static Meridian|Electronic|2017|202509010930
+Oslo Field - The Quiet Cartographer|1|1|1|3|Compass Rose|412|The Quiet Cartographer|Oslo Field|Ambient|2025|202510060930
+Oslo Field - The Quiet Cartographer|1|1|2|3|Contour Lines|356|The Quiet Cartographer|Oslo Field|Ambient|2025|202510060930
+Oslo Field - The Quiet Cartographer|1|1|3|3|The Quiet Cartographer|570|The Quiet Cartographer|Oslo Field|Ambient|2025|202510060930
+TRACKS
+SH
+}
+
+# Triggers a full library scan through the Subsonic API (admin-only
+# /rest/startScan.view). Plain-password auth keeps the call free of salt/token
+# juggling. The folder watcher can start a scan of its own at the same time, so
+# a rejected request is retried until the API accepts it.
+start_scan() {
+  local deadline=$((SECONDS + 30)) resp=""
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    resp=$(curl -sS --max-time 15 \
+      "${LOCAL_URL}/rest/startScan.view?u=${ADMIN_USER}&p=${ADMIN_PASS}&v=1.16.1&c=tester-env&f=json&fullScan=true") \
+      || resp=""
+    contains "${resp}" '"status":"ok"' && return 0
+    sleep 1
+  done
+  die "scan request was rejected: ${resp}"
+}
+
+wait_for_tracks() {
+  local deadline=$((SECONDS + 180)) tracks albums
+  login_token
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    tracks=$(api_count "/song")
+    albums=$(api_count "/album")
+    if [ "${tracks}" = "${EXPECTED_TRACKS}" ] && [ "${albums}" = "${EXPECTED_ALBUMS}" ]; then
+      log "scan finished: ${tracks} tracks in ${albums} albums"
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs --tail 40 "${CONTAINER_NAME}" 2>&1 || true
+  die "scan did not index ${EXPECTED_TRACKS} tracks in ${EXPECTED_ALBUMS} albums within 180s"
+}
+
+# Reads the scanned library once; ids are random per run, so everything that
+# follows is looked up by stable names/titles.
+load_library() {
+  if [ -z "${SONGS_JSON}" ]; then
+    ALBUMS_JSON=$(api "/album")
+    SONGS_JSON=$(api "/song")
+  fi
+}
+
+album_id() { printf '%s' "${ALBUMS_JSON}" | json_pick name "$1" id; }
+song_id() { printf '%s' "${SONGS_JSON}" | json_pick title "$1" id; }
+
+seed_user() { # <userName> <name> <email>
+  local user="$1" name="$2" email="$3" id body
+  id=$(api "/user" | json_pick userName "${user}" id)
+  if [ -n "${id}" ]; then
+    log "user ${user} already exists"
+    return 0
+  fi
+  body=$(python3 -c '
+import json, sys
+user, name, email = sys.argv[1:4]
+print(json.dumps({"userName": user, "name": name, "email": email,
+                  "password": user, "isAdmin": False}))
+' "${user}" "${name}" "${email}")
+  id=$(json_id "$(api_post "/user" "${body}")")
+  [ -n "${id}" ] || die "could not create user ${user}"
+  log "created non-admin user ${user} (${name})"
+}
+
+seed_users() {
+  login_token
+  seed_user maya "Maya Chen" "maya.chen@sundialrecords.example"
+  seed_user theo "Theo Alvarez" "theo.alvarez@sundialrecords.example"
+}
+
+# Playlists are recreated on every seed so name/comment/public/tracks always
+# match this table exactly (createdAt is server time and is never asserted).
+seed_playlist() { # <owner> <pass> <name> <comment> <public> <title>...
+  local owner="$1" pass="$2" name="$3" comment="$4" public="$5"
+  shift 5
+  local count=$# id body ids
+  login_as "${owner}" "${pass}"
+  id=$(api "/playlist" | json_pick name "${name}" id)
+  if [ -n "${id}" ]; then
+    api_delete "/playlist/${id}" >/dev/null
+  fi
+  body=$(python3 -c '
+import json, sys
+name, comment, public = sys.argv[1:4]
+print(json.dumps({"name": name, "comment": comment, "public": public == "true"}))
+' "${name}" "${comment}" "${public}")
+  id=$(json_id "$(api_post "/playlist" "${body}")")
+  [ -n "${id}" ] || die "could not create playlist ${name}"
+  ids=$(SONGS_JSON="${SONGS_JSON}" python3 -c '
+import json, os, sys
+songs = {s["title"]: s["id"] for s in json.loads(os.environ["SONGS_JSON"])}
+titles = sys.argv[1:]
+missing = [t for t in titles if t not in songs]
+if missing:
+    sys.exit("missing seeded songs: " + ", ".join(missing))
+print(json.dumps({"ids": [songs[t] for t in titles]}))
+' "$@") || die "could not resolve tracks for playlist ${name}"
+  api_post "/playlist/${id}/tracks" "${ids}" >/dev/null
+  log "seeded playlist ${name} (owner ${owner}, public=${public}, ${count} tracks)"
+}
+
+seed_playlists() {
+  seed_playlist admin "${ADMIN_PASS}" "Late Night Drive" \
+    "Selections for the long way home." true \
+    "Last Stop" "Downtown" "Static Drift" "Blue Harbor" "First Snow"
+  seed_playlist maya maya "Sunday Morning" "Slow start, coffee on." true \
+    "Riverbank" "Treeline" "Low Tide" "Held Open"
+  seed_playlist admin "${ADMIN_PASS}" "Focus Session" \
+    "No lyrics, no distractions." false \
+    "First Snow" "Pale Horizon" "Treeline" "Compass Rose"
+  seed_playlist theo theo "Shop Floor Rotation" \
+    "What is playing in the shop this week." true \
+    "Low Ceilings" "Brass & Velvet" "Relay" "Uptown Lights"
+}
+
+set_rating() { # <id> <stars> <label>
+  local resp
+  resp=$(subsonic setRating "id=$1&rating=$2")
+  contains "${resp}" '"status":"ok"' || die "could not rate $3: ${resp}"
+}
+
+# Favourites and star ratings are per user, so they belong to the admin here.
+seed_annotations() {
+  login_token
+  local item resp
+  for item in "Blue Harbor" "Signal Bloom"; do
+    resp=$(subsonic star "albumId=$(album_id "${item}")")
+    contains "${resp}" '"status":"ok"' || die "could not star album ${item}: ${resp}"
+  done
+  for item in "Last Stop" "Riverbank" "First Snow"; do
+    resp=$(subsonic star "id=$(song_id "${item}")")
+    contains "${resp}" '"status":"ok"' || die "could not star song ${item}: ${resp}"
+  done
+  set_rating "$(album_id "Paper Lanterns")" 5 "album Paper Lanterns"
+  set_rating "$(album_id "Tidal Works")" 4 "album Tidal Works"
+  set_rating "$(album_id "Night Bus")" 3 "album Night Bus"
+  set_rating "$(song_id "Salt & Smoke")" 4 "song Salt & Smoke"
+  set_rating "$(song_id "Treeline")" 2 "song Treeline"
+  log "seeded 5 stars and 5 ratings for admin"
+}
+
+seed_radio() { # <name> <streamUrl> <homePageUrl>
+  local id body
+  id=$(api "/radio" | json_pick name "$1" id)
+  if [ -n "${id}" ]; then
+    log "radio station $1 already exists"
+    return 0
+  fi
+  body=$(python3 -c '
+import json, sys
+print(json.dumps({"name": sys.argv[1], "streamUrl": sys.argv[2],
+                  "homePageUrl": sys.argv[3]}))
+' "$1" "$2" "$3")
+  id=$(json_id "$(api_post "/radio" "${body}")")
+  [ -n "${id}" ] || die "could not create radio station $1"
+  log "created radio station $1"
+}
+
+seed_radios() {
+  login_token
+  seed_radio "Night Drive FM" \
+    "https://streams.example.net/night-drive-128.mp3" "https://example.net/night-drive"
+  seed_radio "Sunday Classical" \
+    "https://streams.example.net/sunday-classical-128.mp3" "https://example.net/sunday-classical"
+}
+
+# Fixed far-future expiry keeps the share visible without a wall-clock maximum.
+seed_share() { # <description> <resourceIds> <downloadable>
+  local id body
+  id=$(api "/share" | json_pick description "$1" id)
+  if [ -n "${id}" ]; then
+    log "share $1 already exists"
+    return 0
+  fi
+  body=$(python3 -c '
+import json, sys
+print(json.dumps({"description": sys.argv[1], "resourceIds": sys.argv[2],
+                  "downloadable": sys.argv[3] == "true",
+                  "expiresAt": "2030-12-31T00:00:00Z"}))
+' "$1" "$2" "$3")
+  id=$(json_id "$(api_post "/share" "${body}")")
+  [ -n "${id}" ] || die "could not create share $1"
+  log "created share $1"
+}
+
+seed_shares() {
+  login_token
+  seed_share "Night Bus (full album)" "$(album_id "Night Bus")" true
+  seed_share "Late Night Drive playlist" \
+    "$(api "/playlist" | json_pick name "Late Night Drive" id)" false
+}
+
+cmd_seed() {
+  need_docker
+  require_running
+
+  write_music_fixtures
+
+  log "triggering a full scan (GET /rest/startScan.view?fullScan=true)"
+  start_scan
+  wait_for_tracks
+
+  login_token
+  load_library
+  seed_users
+  seed_playlists
+  seed_annotations
+  seed_radios
+  seed_shares
+
+  log "seed complete: ${EXPECTED_ALBUMS} albums / ${EXPECTED_TRACKS} tracks / ${EXPECTED_USERS} users / ${EXPECTED_PLAYLISTS} playlists / ${EXPECTED_RADIOS} radio stations / ${EXPECTED_SHARES} shares"
+}
+
+# API-level seed checks. These are the same rows the UI renders on
+# /app/#/album, /app/#/song, /app/#/playlist, /app/#/radio, /app/#/share,
+# /app/#/user and the Starred / Top Rated album lists.
+cmd_verify() {
+  need_docker
+  require_running
+  local resp albums tracks artists first starred top_rated starred_songs
+  local longest playlists maya_playlists users radios shares
+
+  log "checking deterministic admin login (${ADMIN_USER}/${ADMIN_PASS})"
+  login_token
+
+  log "checking the seeded library through the native API"
+  albums=$(api_count "/album")
+  tracks=$(api_count "/song")
+  artists=$(api_count "/artist")
+  [ "${albums}" = "${EXPECTED_ALBUMS}" ] || die "/api/album returned ${albums} rows, expected ${EXPECTED_ALBUMS}"
+  [ "${tracks}" = "${EXPECTED_TRACKS}" ] || die "/api/song returned ${tracks} rows, expected ${EXPECTED_TRACKS}"
+  [ "${artists}" = "${EXPECTED_ARTISTS}" ] || die "/api/artist returned ${artists} rows, expected ${EXPECTED_ARTISTS}"
+  log "api: ${albums} albums, ${tracks} tracks, ${artists} artists"
+
+  resp=$(api "/album")
+  for name in "Blue Harbor" "Northern Lines" "Low Ceilings" "Field Notes, Vol. 1" \
+              "Night Bus" "Paper Lanterns" "Signal Bloom" "Tidal Works" \
+              "Static Meridian" "The Quiet Cartographer"; do
+    contains "${resp}" "\"name\":\"${name}\"" || die "album '${name}' is missing from /api/album"
+  done
+  log "all 10 album names are indexed"
+
+  api "/artist" | python3 -c '
+import json, sys
+names = {a["name"] for a in json.load(sys.stdin)}
+expected = {"Marina Vale", "Oslo Field", "Delta Groove",
+            "Clara Voss & The Lantern Choir", "Clara Voss", "Static Meridian"}
+missing = expected - names
+if missing:
+    sys.exit("missing artists: " + ", ".join(sorted(missing)))
+' || die "artist names missing from /api/artist"
+
+  resp=$(api "/genre")
+  for name in Jazz Ambient Funk Folk Electronic; do
+    contains "${resp}" "\"name\":\"${name}\"" || die "genre '${name}' is missing from /api/genre"
+  done
+  log "artists and genres present"
+
+  api "/song" | python3 -c '
+import json, sys
+titles = {s["title"] for s in json.load(sys.stdin)}
+expected = {"Low Tide", "White Noise Waltz", "Brass & Velvet", "Evening Service",
+            "Corner Store", "Homewards", "Signal Bloom", "Harbourmaster",
+            "Dead Air", "Contour Lines"}
+missing = expected - titles
+if missing:
+    sys.exit("missing tracks: " + ", ".join(sorted(missing)))
+' || die "track titles missing from /api/song"
+  log "track titles from every album are indexed"
+
+  # Album grouping: the double album has two discs, the rest one.
+  api "/album" | python3 -c '
+import json, sys
+albums = {a["name"]: a for a in json.load(sys.stdin)}
+multi = albums["Field Notes, Vol. 1"]
+assert multi["songCount"] == 6, ("Field Notes songCount", multi["songCount"])
+assert sorted(multi["discs"].keys()) == ["1", "2"], ("Field Notes discs", multi["discs"])
+assert multi["genre"] == "Folk" and multi["maxYear"] == 2020, (multi["genre"], multi["maxYear"])
+quiet = albums["The Quiet Cartographer"]
+assert quiet["songCount"] == 3 and quiet["maxYear"] == 2025, (quiet["songCount"], quiet["maxYear"])
+works = albums["Tidal Works"]
+assert works["songCount"] == 6 and works["genre"] == "Jazz", (works["songCount"], works["genre"])
+assert albums["Blue Harbor"]["albumArtist"] == "Marina Vale", albums["Blue Harbor"]["albumArtist"]
+' || die "album metadata assertions failed"
+  log "album metadata: double-disc Field Notes, Vol. 1 (6 tracks) + genres/years"
+
+  # UI list contracts: recently added (fixed mtimes), Starred, Top Rated.
+  first=$(api_get "/album" --data-urlencode '_sort=recently_added' --data-urlencode '_order=DESC' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["name"])')
+  [ "${first}" = "The Quiet Cartographer" ] || die "newest album is '${first}', expected 'The Quiet Cartographer'"
+
+  starred=$(api_get "/album" --data-urlencode 'starred=true' \
+    --data-urlencode '_sort=starred_at' --data-urlencode '_order=DESC' | json_sorted_list name)
+  [ "${starred}" = "Blue Harbor,Signal Bloom" ] || die "starred albums: '${starred}'"
+
+  top_rated=$(api_get "/album" --data-urlencode 'has_rating=true' \
+    --data-urlencode '_sort=rating' --data-urlencode '_order=DESC' | json_list name)
+  [ "${top_rated}" = "Paper Lanterns,Tidal Works,Night Bus" ] || die "top rated albums: '${top_rated}'"
+
+  starred_songs=$(api_get "/song" --data-urlencode 'starred=true' | json_sorted_list title)
+  [ "${starred_songs}" = "First Snow,Last Stop,Riverbank" ] || die "starred songs: '${starred_songs}'"
+  log "list contracts: recentlyAdded=The Quiet Cartographer, starred=2 albums/3 songs, topRated order stable"
+
+  longest=$(api_get "/song" --data-urlencode '_sort=duration' --data-urlencode '_order=DESC' \
+    | python3 -c 'import json,sys; s=json.load(sys.stdin)[0]; print("%s %d" % (s["title"], int(s["duration"])))')
+  contains "${longest}" "The Quiet Cartographer 570" || die "longest track: '${longest}', expected 'The Quiet Cartographer 570'"
+  log "durations vary (longest: ${longest}s)"
+
+  # Playlists: owner, public flag and exact track counts.
+  playlists=$(api "/playlist" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+print(";".join("%s|%s|%s|%s" % (p["name"], p["songCount"],
+      "true" if p["public"] else "false", p["ownerName"])
+      for p in sorted(rows, key=lambda p: p["name"])))
+')
+  [ "${playlists}" = "Focus Session|4|false|admin;Late Night Drive|5|true|admin;Shop Floor Rotation|4|true|theo;Sunday Morning|4|true|maya" ] \
+    || die "admin playlists: '${playlists}'"
+  log "admin sees 4 playlists incl. the private 'Focus Session'"
+
+  login_as maya maya
+  [ "${IS_ADMIN}" = false ] || die "maya should be a non-admin user"
+  maya_playlists=$(api "/playlist" | json_sorted_list name)
+  [ "${maya_playlists}" = "Late Night Drive,Shop Floor Rotation,Sunday Morning" ] \
+    || die "maya playlists: '${maya_playlists}' (private admin playlist must be hidden)"
+  log "maya sees 3 playlists (private admin playlist hidden)"
+
+  login_as theo theo
+  [ "${IS_ADMIN}" = false ] || die "theo should be a non-admin user"
+  login_token
+
+  users=$(api "/user" | json_sorted_list userName)
+  [ "${users}" = "admin,maya,theo" ] || die "users: '${users}'"
+  [ "$(api_count "/user")" = "${EXPECTED_USERS}" ] || die "/api/user does not return ${EXPECTED_USERS} rows"
+
+  radios=$(api "/radio" | json_sorted_list name)
+  [ "${radios}" = "Night Drive FM,Sunday Classical" ] || die "radio stations: '${radios}'"
+  [ "$(api_count "/radio")" = "${EXPECTED_RADIOS}" ] || die "/api/radio does not return ${EXPECTED_RADIOS} rows"
+
+  shares=$(api "/share" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+print(";".join("%s|%s|%s" % (s["description"], s["resourceType"], s["contents"])
+      for s in sorted(rows, key=lambda s: s["description"])))
+')
+  [ "${shares}" = "Late Night Drive playlist|playlist|Late Night Drive;Night Bus (full album)|album|Night Bus" ] \
+    || die "shares: '${shares}'"
+  [ "$(api_count "/share")" = "${EXPECTED_SHARES}" ] || die "/api/share does not return ${EXPECTED_SHARES} rows"
+  log "users, radio stations and shares match"
+
+  # The SPA shell must be served; browser-checker owns the actual UI proof.
+  [ "$(body -o /dev/null -w '%{http_code}' "${LOCAL_URL}/app/")" = "200" ] \
+    || die "/app/ is not served"
+  log "UI shell served at ${LOCAL_URL}/app/"
+
+  log "verify passed: admin login, ${albums} albums/${tracks} tracks/${artists} artists, ${EXPECTED_PLAYLISTS} playlists, ${EXPECTED_USERS} users, ${EXPECTED_RADIOS} radio, ${EXPECTED_SHARES} shares"
+}
+
+cmd_reset() {
+  need_docker
+  log "resetting environment"
+  if container_exists; then
+    docker stop --time 10 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null
+  fi
+  local volume
+  for volume in "${DATA_VOLUME}" "${MUSIC_VOLUME}"; do
+    case "${volume}" in
+      navidrome-data*|navidrome-music*)
+        docker volume rm "${volume}" >/dev/null 2>&1 || true
+        ;;
+      *) die "refusing to remove unexpected volume ${volume}" ;;
+    esac
+  done
+  log "reset complete (container and volumes removed; image kept for reuse)"
+}
+
+cmd_stop() {
+  need_docker
+  if container_running; then
+    docker stop --time 10 "${CONTAINER_NAME}" >/dev/null
+    log "stopped ${CONTAINER_NAME} (data preserved in ${DATA_VOLUME}/${MUSIC_VOLUME})"
+  else
+    log "container ${CONTAINER_NAME} is not running"
+  fi
+}
+
+cmd_logs() {
+  need_docker
+  local tail_lines="${TAIL:-200}"
+  local follow=""
+  for arg in "$@"; do
+    case "${arg}" in
+      --follow|-f) follow="-f" ;;
+      *) tail_lines="${arg}" ;;
+    esac
+  done
+  docker logs --tail "${tail_lines}" ${follow} "${CONTAINER_NAME}" 2>&1 || die "no logs for ${CONTAINER_NAME}"
+}
+
+cmd_status() {
+  echo "App: navidrome"
+  echo "Image: ${IMAGE_NAME}"
+  echo "Port: ${PORT} (container ${CONTAINER_PORT})"
+  echo "URL: ${LOCAL_URL}/app/"
+  echo "Container: ${CONTAINER_NAME}"
+  echo "Volumes: ${DATA_VOLUME}:/data ${MUSIC_VOLUME}:/music"
+  if container_running; then
+    echo "Status: RUNNING"
+    echo "Credentials: ${ADMIN_USER}/${ADMIN_PASS}"
+  elif container_exists; then
+    echo "Status: STOPPED"
+  else
+    echo "Status: NOT RUNNING"
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+navidrome - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the upstream Dockerfile, start the container, prove the
+            deterministic admin login (${ADMIN_USER}/${ADMIN_PASS})
+  seed      Generate the deterministic library (10 tagged albums, 47 FLAC
+            tracks, covers), run a full scan, then seed users, playlists,
+            stars/ratings, radio stations and shares through /api and /rest;
+            safe to re-run
+  verify    Log in and assert the seeded library, playlists, users, radio,
+            shares, list filters and that /app/ is served
+  reset     Stop and remove the container and both run-scoped volumes
+            (keeps the image)
+  stop      Stop the container (data preserved); 'down' is an alias
+  logs      Show container logs (TAIL=<n>, --follow)
+  status    Show container/image/URL/credential state
+  help      Show this help
+
+Options:
+  --run-id <id>   Scope container and volume names for parallel runs. Default: default
+  --port <port>   Host port bound to container ${CONTAINER_PORT}. Default: ${CONTAINER_PORT}
+
+Environment:
+  IMAGE_TAG       Content-addressed image tag exported by scripts/rl-env
+                  (default: tester-env-navidrome:dev)
+  RUN_ID          Run id; scopes container + volumes, never the image name
+  PORT            Host port (same as --port)
+
+Determinism:
+  deploy sets ND_ENABLEEXTERNALSERVICES=false (no insights/agents/remote login
+  background), ND_AUTHREQUESTLIMIT=0, ND_PLUGINS_ENABLED=false,
+  ND_DEVAUTOCREATEADMINPASSWORD=admin (admin/admin exists before the UI's
+  create-admin wizard) and ND_RECENTLYADDEDBYMODTIME=true with fixed fixture
+  mtimes so "recently added" ordering is stable. TZ=UTC.
+
+Seed data (baseline, ordinary app writes only):
+  - admin / admin (admin), maya / maya and theo / theo (non-admin).
+  - Library "Sundial Records": 10 albums / 47 tracks / 6 album artists /
+    Jazz, Ambient, Funk, Folk, Electronic / 2017-2025, one double-disc album
+    ("Field Notes, Vol. 1"), varied durations up to 9:30.
+  - 4 playlists: Late Night Drive (admin, public, 5 tracks), Sunday Morning
+    (maya, public, 4), Focus Session (admin, private, 4), Shop Floor Rotation
+    (theo, public, 4).
+  - admin favourites: albums Blue Harbor + Signal Bloom, songs Last Stop +
+    Riverbank + First Snow; album ratings Paper Lanterns 5, Tidal Works 4,
+    Night Bus 3; song ratings Salt & Smoke 4, Treeline 2.
+  - 2 radio stations (Night Drive FM, Sunday Classical) and 2 shares
+    (Night Bus album, Late Night Drive playlist; expiry fixed 2030-12-31).
+  Ids are random per run; every seed step looks rows up by name, so re-running
+  seed is idempotent.
+
+Seed and reset:
+  - The library is generated by the image's ffmpeg at seed time: fixed tags,
+    fixed mtimes (2025-01..2025-10) and folder.jpg covers. Seed then triggers
+    /rest/startScan.view (fullScan=true) and waits for 47 tracks / 10 albums.
+  - All state lives in /data (SQLite + WAL, cache, JWT secret). ./tester-env
+    reset removes the container and every volume, so the next deploy is a
+    fresh admin/admin database with an empty library.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  local passthrough=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id)
+        [ $# -ge 2 ] || die "--run-id requires a value"
+        RUN_ID="$2"
+        shift 2
+        ;;
+      --port)
+        [ $# -ge 2 ] || die "--port requires a value"
+        PORT="$2"
+        shift 2
+        ;;
+      --help|-h)
+        cmd_help
+        exit 0
+        ;;
+      *)
+        passthrough+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  refresh_names
+
+  case "${cmd}" in
+    deploy) cmd_deploy ;;
+    seed) cmd_seed ;;
+    verify) cmd_verify ;;
+    reset) cmd_reset ;;
+    stop|down) cmd_stop ;;
+    logs) cmd_logs "${passthrough[@]+"${passthrough[@]}"}" ;;
+    status) cmd_status ;;
+    help|--help|-h) cmd_help ;;
+    *)
+      printf '==> ERROR: unknown command %s\n' "${cmd}" >&2
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "app": "navidrome",
+  "credentials": "admin / admin (admin), maya / maya and theo / theo (non-admin)",
+  "seed_command": "./tester-env seed (from this fork or apps/navidrome; reset first with ./tester-env reset && ./tester-env deploy)",
+  "verify_command": "./tester-env verify",
+  "not_browser_observable": [
+    "song-duration-variety: durations come from the generated audio files and are visible as the Duration column and album total, but exact second values are only asserted through /api; use ranges in the UI.",
+    "share-expiry-2030: the fixed 2030-12-31T00:00:00Z expiry is shown as a date on the Shares list; it is stable until 2030 and must not be asserted as a relative 'expires in ...' string."
+  ],
+  "notes": "Seed generates 10 tagged FLAC albums / 47 tracks with the image's ffmpeg (fixed tags, fixed file mtimes 2025-01-06..2025-10-06, folder.jpg covers, one double-disc album), triggers GET /rest/startScan.view?fullScan=true and waits for 47 tracks / 10 albums, then writes users, playlists, stars/ratings, radio stations and shares through /api and /rest with the admin JWT. Record ids are random per run, so every step resolves rows by stable names/titles; playlists are recreated and users/radio/shares are created only when absent, making seed idempotent. Nothing depends on the wall clock: 'recently added' uses the fixed mtimes (ND_RECENTLYADDEDBYMODTIME=true) and shares expire at a fixed far-future date. Seeded music volume is ~157 MB and seed takes ~45 s.",
+  "requirements": {
+    "album-catalogue": {
+      "status": "present",
+      "evidence": "10 albums / 47 tracks / 6 album artists (Marina Vale, Oslo Field, Delta Groove, Clara Voss & The Lantern Choir, Clara Voss, Static Meridian) across Jazz/Ambient/Funk/Folk/Electronic, years 2017-2025. tester-env verify asserts the exact counts, all 10 album names, the 6 artists, the 5 genres and one representative track title per album."
+    },
+    "album-metadata": {
+      "status": "present",
+      "evidence": "Every album carries albumArtist, genre, maxYear, songCount and duration; album cards/table render artist, year, song count, duration and rating. verify asserts Field Notes, Vol. 1 (Folk 2020), Tidal Works (Jazz 2024, 6 tracks) and The Quiet Cartographer (Ambient 2025, 3 tracks)."
+    },
+    "double-disc-album": {
+      "status": "present",
+      "evidence": "Field Notes, Vol. 1 (Clara Voss & The Lantern Choir, Folk 2020) is tagged disc 1/2 and disc 2/2 with three tracks each; /api/album reports discs {'1','2'} and songCount 6, and the album song table groups by disc. verify asserts both."
+    },
+    "song-duration-variety": {
+      "status": "present",
+      "evidence": "Generated track lengths run 167 s (Salt & Smoke) to 570 s (The Quiet Cartographer, the longest); the album Duration column sums them (Field Notes, Vol. 1 = 1502 s). verify sorts songs by duration DESC and asserts the longest title/duration."
+    },
+    "recently-added-order": {
+      "status": "present",
+      "evidence": "Album files/folders carry fixed mtimes 2025-01-06 .. 2025-10-06 and ND_RECENTLYADDEDBYMODTIME=true, so Recently Added sorts by that order without scan-time drift; verify asserts the first album is The Quiet Cartographer (2025-10-06)."
+    },
+    "favourites-and-ratings": {
+      "status": "present",
+      "evidence": "As admin: stars on albums Blue Harbor and Signal Bloom and songs Last Stop, Riverbank, First Snow; album ratings Paper Lanterns 5, Tidal Works 4, Night Bus 3; song ratings Salt & Smoke 4, Treeline 2. Written through /rest/star.view and /rest/setRating.view, so the Starred and Top Rated album lists and song-table stars/ratings are non-empty. verify asserts the exact starred album/song sets and the rating-desc order Paper Lanterns, Tidal Works, Night Bus."
+    },
+    "public-and-private-playlists": {
+      "status": "present",
+      "evidence": "Late Night Drive (admin, public, 5 tracks), Sunday Morning (maya, public, 4), Focus Session (admin, private, 4), Shop Floor Rotation (theo, public, 4). verify asserts names, owners, public flags and track counts as admin, and that maya sees only the three public playlists (the private admin playlist is hidden)."
+    },
+    "non-admin-users": {
+      "status": "present",
+      "evidence": "admin (admin, email empty), maya / Maya Chen and theo / Theo Alvarez (non-admin, .example emails, password == username, auto-assigned to the default library). verify asserts the 3 user rows via /api/user and that maya/theo log in with isAdmin false."
+    },
+    "radio-stations": {
+      "status": "present",
+      "evidence": "Night Drive FM and Sunday Classical with fixed stream/home-page URLs on reserved example domains (inert data, no network call). verify asserts both names and the 2-row count."
+    },
+    "shares": {
+      "status": "present",
+      "evidence": "'Night Bus (full album)' (album share, downloadable) and 'Late Night Drive playlist' (playlist share, not downloadable), both expiring 2030-12-31T00:00:00Z. verify asserts descriptions, resource types and contents labels."
+    }
+  }
+}
